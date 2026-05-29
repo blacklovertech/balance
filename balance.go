@@ -14,41 +14,49 @@ var (
 )
 
 // Balance represents a smooth weighted round-robin load balancer.
-type Balance struct {
+type Balance[T comparable] struct {
 	sync.RWMutex
 
 	// items is the list of items to balance
-	items []*Item
-	// next is the index of the next item to use.
-	next *Item
+	items []*Item[T]
+	// next is the next item to use.
+	next *Item[T]
 }
 
 // NewBalance creates a new load balancer.
-func NewBalance() *Balance {
-	return &Balance{
-		items: make([]*Item, 0),
+func NewBalance[T comparable]() *Balance[T] {
+	return &Balance[T]{
+		items: make([]*Item[T], 0),
 	}
 }
 
 // Item represents the item in the list.
-type Item struct {
+type Item[T comparable] struct {
 	// id is the id of the item.
-	id string
+	id T
 	// weight is the weight of the item that is given by the user.
 	weight int
-	// current is the current weight of the item.
+	// effective is the current effective weight of the item (reduced temporarily on failures).
+	effective int
+	// current is the current running weight of the item in SWRR selection.
 	current int
+	// active determines if the item should be considered in balancing.
+	active bool
 }
 
-func NewItem(id string, weight int) *Item {
-	return &Item{
-		id:      id,
-		weight:  weight,
-		current: 0,
+// NewItem creates a new item with active status set to true.
+func NewItem[T comparable](id T, weight int) *Item[T] {
+	return &Item[T]{
+		id:        id,
+		weight:    weight,
+		effective: weight,
+		current:   0,
+		active:    true,
 	}
 }
 
-func (b *Balance) Add(id string, weight int) error {
+// Add appends a new item with its corresponding weight to the balancer.
+func (b *Balance[T]) Add(id T, weight int) error {
 	b.Lock()
 	defer b.Unlock()
 	for _, v := range b.items {
@@ -62,28 +70,55 @@ func (b *Balance) Add(id string, weight int) error {
 	return nil
 }
 
-func (b *Balance) Get() string {
+// Get selects and returns the next item from the balancer using the
+// Smooth Weighted Round-Robin algorithm with Nginx effective weight adjustments.
+func (b *Balance[T]) Get() T {
 	b.Lock()
 	defer b.Unlock()
 
-	if len(b.items) == 0 {
-		return ""
+	var zero T
+
+	// Filter active items
+	var activeItems []*Item[T]
+	for _, item := range b.items {
+		if item.active {
+			activeItems = append(activeItems, item)
+		}
 	}
 
-	// Total weight of all items.
+	if len(activeItems) == 0 {
+		return zero
+	}
+
+	// Calculate total effective weight
 	var total int
+	for _, item := range activeItems {
+		total += item.effective
+	}
 
-	// Loop through the list of items and add the item's weight to the current weight.
-	// Also increment the total weight counter.
-	var max *Item
-	for _, item := range b.items {
-		item.current += item.weight
-		total += item.weight
+	// Self-healing fallback: If all active nodes have degraded to 0 effective weight,
+	// restore their effective weights back to their base weights to avoid starvation.
+	if total == 0 {
+		for _, item := range activeItems {
+			item.effective = item.weight
+			item.current = 0
+			total += item.effective
+		}
+	}
 
-		// Select the item with max weight.
+	// SWRR selection using effective weight instead of base weight
+	var max *Item[T]
+	for _, item := range activeItems {
+		item.current += item.effective
+
+		// Select the item with max current weight.
 		if max == nil || item.current > max.current {
 			max = item
 		}
+	}
+
+	if max == nil {
+		return zero
 	}
 
 	// Select the item with the max weight.
@@ -95,7 +130,7 @@ func (b *Balance) Get() string {
 }
 
 // Remove deletes an item by ID from the balancer.
-func (b *Balance) Remove(id string) error {
+func (b *Balance[T]) Remove(id T) error {
 	b.Lock()
 	defer b.Unlock()
 
@@ -110,13 +145,83 @@ func (b *Balance) Remove(id string) error {
 }
 
 // ItemIDs returns a list of all item IDs in the balancer.
-func (b *Balance) ItemIDs() []string {
+func (b *Balance[T]) ItemIDs() []T {
 	b.RLock()
 	defer b.RUnlock()
 
-	ids := make([]string, len(b.items))
+	ids := make([]T, len(b.items))
 	for i, item := range b.items {
 		ids[i] = item.id
 	}
 	return ids
+}
+
+// UpdateWeight updates the weight of an item dynamically and resets its effective weight.
+func (b *Balance[T]) UpdateWeight(id T, weight int) error {
+	b.Lock()
+	defer b.Unlock()
+
+	for _, item := range b.items {
+		if item.id == id {
+			item.weight = weight
+			item.effective = weight
+			return nil
+		}
+	}
+
+	return ErrIDNotFound
+}
+
+// SetActive toggles the active status of an item.
+func (b *Balance[T]) SetActive(id T, active bool) error {
+	b.Lock()
+	defer b.Unlock()
+
+	for _, item := range b.items {
+		if item.id == id {
+			item.active = active
+			// Reset current weight if deactivating to prevent stale build-up
+			if !active {
+				item.current = 0
+				item.effective = item.weight
+			}
+			return nil
+		}
+	}
+
+	return ErrIDNotFound
+}
+
+// RecordFailure decreases the effective weight of an item by 1, to a minimum of 0.
+func (b *Balance[T]) RecordFailure(id T) error {
+	b.Lock()
+	defer b.Unlock()
+
+	for _, item := range b.items {
+		if item.id == id {
+			if item.effective > 0 {
+				item.effective--
+			}
+			return nil
+		}
+	}
+
+	return ErrIDNotFound
+}
+
+// RecordSuccess increases the effective weight of an item by 1, to a maximum of its configured weight.
+func (b *Balance[T]) RecordSuccess(id T) error {
+	b.Lock()
+	defer b.Unlock()
+
+	for _, item := range b.items {
+		if item.id == id {
+			if item.effective < item.weight {
+				item.effective++
+			}
+			return nil
+		}
+	}
+
+	return ErrIDNotFound
 }

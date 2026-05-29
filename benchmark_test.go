@@ -15,7 +15,7 @@ func BenchmarkBalance(b *testing.B) {
 
 	for n := 10; n <= 100000; n *= 10 {
 		b.Run("items-"+strconv.Itoa(n), func(b *testing.B) {
-			bl := balance.NewBalance()
+			bl := balance.NewBalance[string]()
 			items := generateItems(n)
 			for i, w := range items {
 				bl.Add(i, w)
